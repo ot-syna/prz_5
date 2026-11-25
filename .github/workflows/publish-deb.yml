@@ -1,0 +1,134 @@
+name: Build & Publish syspulse .deb to Nexus (APT)
+
+on:
+  push:
+    branches: ["release"]
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.21"
+  APT_DIST: stable
+  APT_COMPONENT: main
+  NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
+  NEXUS_USER: ${{ secrets.NEXUS_USER }}
+  NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+
+jobs:
+  build-publish-verify:
+    runs-on: self-hosted
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. Сборка статического бинарника под linux/amd64
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build static Linux binary
+        run: |
+          if (!(Test-Path "dist")) { New-Item -ItemType Directory -Path "dist" | Out-Null }
+          $env:GOOS = "linux"
+          $env:GOARCH = "amd64"
+          $env:CGO_ENABLED = "0"
+          go build -o dist/syspulse .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item dist/syspulse | Select-Object Name, Length
+
+      # 2. Упаковка в .deb внутри Ubuntu-контейнера (dpkg-deb)
+      - name: Package as .deb
+        id: pack
+        run: |
+          $match = Select-String -Path "main.go" -Pattern 'const Version = "([0-9.]+)"'
+          if (-not $match) {
+            Write-Error "Failed to extract Version from main.go"
+            exit 1
+          }
+          $ver = $match.Matches[0].Groups[1].Value
+          $pkg = "syspulse"
+          Write-Host "Building package $pkg version $ver"
+
+          $debPath = "dist/${pkg}_${ver}_amd64.deb"
+          "pkg_ver=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "deb_path=$debPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+          $workDir = (Get-Location).Path
+          docker run --rm -v "${workDir}:/work" -w /work -e "PKG=$pkg" -e "VER=$ver" ubuntu:22.04 bash -c '
+            set -euo pipefail
+            ROOT="build/${PKG}_${VER}"
+            rm -rf "${ROOT}"
+            mkdir -p "${ROOT}/DEBIAN" "${ROOT}/usr/bin" dist
+            cp dist/syspulse "${ROOT}/usr/bin/${PKG}"
+            chmod 755 "${ROOT}/usr/bin/${PKG}"
+
+            printf '%s\n' \
+              "Package: ${PKG}" \
+              "Version: ${VER}" \
+              "Section: utils" \
+              "Priority: optional" \
+              "Architecture: amd64" \
+              "Maintainer: DevOps Team <devops@example.com>" \
+              "Description: Lightweight CLI tool for a system health snapshot" \
+              " Reads /proc and reports uptime, load average and memory info." \
+              "Depends: libc6 (>= 2.17)" \
+              > "${ROOT}/DEBIAN/control"
+
+            dpkg-deb --build --root-owner-group "${ROOT}" "dist/${PKG}_${VER}_amd64.deb"
+            dpkg -I "dist/${PKG}_${VER}_amd64.deb"
+          '
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # 3. Публикация в Nexus (APT deploy)
+      - name: Upload .deb to Nexus (APT deploy)
+        run: |
+          $debPath = "${{ steps.pack.outputs.deb_path }}"
+          $debName = Split-Path -Path $debPath -Leaf
+          $url = "http://$($env:NEXUS_HOST):8081/repository/syspulse/deb/binary/$($env:APT_DIST)/$($env:APT_COMPONENT)/syspulse/binary/amd64/$debName"
+
+          curl.exe --fail --silent --show-error `
+            --user "$($env:NEXUS_USER):$($env:NEXUS_PASSWORD)" `
+            -H "Content-Type: application/vnd.debian.binary-package" `
+            --upload-file "$debPath" `
+            "$url"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Package $debName deployed to Nexus APT repository 'syspulse'."
+
+      # 4. Верификация установки через apt в чистом Ubuntu
+      - name: Verify install via apt in Ubuntu container
+        run: |
+          Write-Host "Installing syspulse from Nexus inside a clean ubuntu:22.04..."
+          docker run --rm `
+            -e "NEXUS_HOST=$($env:NEXUS_HOST)" `
+            -e "APT_DIST=$($env:APT_DIST)" `
+            -e "APT_COMPONENT=$($env:APT_COMPONENT)" `
+            ubuntu:22.04 bash -c '
+              set -euo pipefail
+              apt-get update -y
+              apt-get install -y --no-install-recommends ca-certificates curl || true
+
+              echo "deb [trusted=yes] http://${NEXUS_HOST}:8081/repository/syspulse/ ${APT_DIST} ${APT_COMPONENT}" > /etc/apt/sources.list.d/syspulse.list
+              apt-get update
+              apt-get install -y syspulse
+
+              echo "---- package info ----"
+              dpkg -s syspulse | grep -E "^(Package|Version|Architecture)"
+              echo "---- run app ----"
+              syspulse --version
+              syspulse
+            '
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Verification passed: syspulse installed from Nexus and runs correctly."
+
+      # 5. Артефакты (для аудита)
+      - name: Save .deb as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syspulse-deb
+          path: dist/*.deb
+          retention-days: 7
