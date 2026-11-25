@@ -84,11 +84,13 @@ jobs:
       # 3. Публикация в Nexus (APT deploy)
       - name: Upload .deb to Nexus (APT deploy)
         run: |
+          $workDir = (Get-Location).Path
           $debPath = "${{ steps.pack.outputs.deb_path }}"
           $debName = Split-Path -Path $debPath -Leaf
           $url = "http://$($env:NEXUS_HOST):8081/repository/syspulse/deb/binary/$($env:APT_DIST)/$($env:APT_COMPONENT)/syspulse/binary/amd64/$debName"
 
-          curl.exe --fail --silent --show-error `
+          docker run --rm --add-host=host.docker.internal:host-gateway -v "${workDir}:/work" -w /work curlimages/curl:latest `
+            --fail --silent --show-error `
             --user "$($env:NEXUS_USER):$($env:NEXUS_PASSWORD)" `
             -H "Content-Type: application/vnd.debian.binary-package" `
             --upload-file "$debPath" `
@@ -119,7 +121,7 @@ jobs:
           [System.IO.File]::WriteAllText($scriptPath, $verifyScript, [System.Text.UTF8Encoding]::new($false))
 
           try {
-            docker run --rm -v "${workDir}:/work" -w /work `
+            docker run --rm --add-host=host.docker.internal:host-gateway -v "${workDir}:/work" -w /work `
               -e "NEXUS_HOST=$($env:NEXUS_HOST)" `
               -e "APT_DIST=$($env:APT_DIST)" `
               -e "APT_COMPONENT=$($env:APT_COMPONENT)" `
