@@ -78,7 +78,7 @@ jobs:
           $controlPath = Join-Path $workDir "$root/DEBIAN/control"
           [System.IO.File]::WriteAllText($controlPath, $control, [System.Text.UTF8Encoding]::new($false))
 
-          docker run --rm -v "${workDir}:/work" -w /work ubuntu:22.04 bash -c "chmod 755 ${root}/usr/bin/${pkg} && dpkg-deb --build --root-owner-group ${root} ${debPath} && dpkg -I ${debPath}"
+          docker run --rm -v "${workDir}:/work" -w /work ubuntu:22.04 bash -c "rm -rf /tmp/pkg && mkdir -p /tmp/pkg && cp -r ${root} /tmp/pkg/pkgroot && chmod 755 /tmp/pkg/pkgroot /tmp/pkg/pkgroot/DEBIAN /tmp/pkg/pkgroot/usr/bin/${pkg} && chmod 644 /tmp/pkg/pkgroot/DEBIAN/control && dpkg-deb --build --root-owner-group /tmp/pkg/pkgroot ${debPath} && dpkg -I ${debPath}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # 3. Публикация в Nexus (APT deploy)
