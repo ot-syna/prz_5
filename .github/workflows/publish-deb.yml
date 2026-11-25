@@ -53,34 +53,32 @@ jobs:
           $pkg = "syspulse"
           Write-Host "Building package $pkg version $ver"
 
+          $root = "build/${pkg}_${ver}"
           $debPath = "dist/${pkg}_${ver}_amd64.deb"
           "pkg_ver=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "deb_path=$debPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
+          if (Test-Path $root) { Remove-Item -Recurse -Force $root }
+          New-Item -ItemType Directory -Path "$root/DEBIAN", "$root/usr/bin", "dist" -Force | Out-Null
+          Copy-Item "dist/syspulse" "$root/usr/bin/$pkg" -Force
+
+          $control = @(
+            "Package: $pkg",
+            "Version: $ver",
+            "Section: utils",
+            "Priority: optional",
+            "Architecture: amd64",
+            "Maintainer: DevOps Team <devops@example.com>",
+            "Description: Lightweight CLI tool for a system health snapshot",
+            " Reads /proc and reports uptime, load average and memory info.",
+            "Depends: libc6 (>= 2.17)",
+            ""
+          ) -join "`n"
           $workDir = (Get-Location).Path
-          docker run --rm -v "${workDir}:/work" -w /work -e "PKG=$pkg" -e "VER=$ver" ubuntu:22.04 bash -c '
-            set -euo pipefail
-            ROOT="build/${PKG}_${VER}"
-            rm -rf "${ROOT}"
-            mkdir -p "${ROOT}/DEBIAN" "${ROOT}/usr/bin" dist
-            cp dist/syspulse "${ROOT}/usr/bin/${PKG}"
-            chmod 755 "${ROOT}/usr/bin/${PKG}"
+          $controlPath = Join-Path $workDir "$root/DEBIAN/control"
+          [System.IO.File]::WriteAllText($controlPath, $control, [System.Text.UTF8Encoding]::new($false))
 
-            printf '%s\n' \
-              "Package: ${PKG}" \
-              "Version: ${VER}" \
-              "Section: utils" \
-              "Priority: optional" \
-              "Architecture: amd64" \
-              "Maintainer: DevOps Team <devops@example.com>" \
-              "Description: Lightweight CLI tool for a system health snapshot" \
-              " Reads /proc and reports uptime, load average and memory info." \
-              "Depends: libc6 (>= 2.17)" \
-              > "${ROOT}/DEBIAN/control"
-
-            dpkg-deb --build --root-owner-group "${ROOT}" "dist/${PKG}_${VER}_amd64.deb"
-            dpkg -I "dist/${PKG}_${VER}_amd64.deb"
-          '
+          docker run --rm -v "${workDir}:/work" -w /work ubuntu:22.04 bash -c "chmod 755 ${root}/usr/bin/${pkg} && dpkg-deb --build --root-owner-group ${root} ${debPath} && dpkg -I ${debPath}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # 3. Публикация в Nexus (APT deploy)
@@ -102,26 +100,34 @@ jobs:
       - name: Verify install via apt in Ubuntu container
         run: |
           Write-Host "Installing syspulse from Nexus inside a clean ubuntu:22.04..."
-          docker run --rm `
-            -e "NEXUS_HOST=$($env:NEXUS_HOST)" `
-            -e "APT_DIST=$($env:APT_DIST)" `
-            -e "APT_COMPONENT=$($env:APT_COMPONENT)" `
-            ubuntu:22.04 bash -c '
-              set -euo pipefail
-              apt-get update -y
-              apt-get install -y --no-install-recommends ca-certificates curl || true
+          $workDir = (Get-Location).Path
+          $verifyScript = @(
+            'set -euo pipefail',
+            'apt-get update -y',
+            'apt-get install -y --no-install-recommends ca-certificates curl || true',
+            'echo "deb [trusted=yes] http://${NEXUS_HOST}:8081/repository/syspulse/ ${APT_DIST} ${APT_COMPONENT}" > /etc/apt/sources.list.d/syspulse.list',
+            'apt-get update',
+            'apt-get install -y syspulse',
+            'echo "---- package info ----"',
+            'dpkg -s syspulse | grep -E "^(Package|Version|Architecture)"',
+            'echo "---- run app ----"',
+            'syspulse --version',
+            'syspulse',
+            ''
+          ) -join "`n"
+          $scriptPath = Join-Path $workDir "verify.sh"
+          [System.IO.File]::WriteAllText($scriptPath, $verifyScript, [System.Text.UTF8Encoding]::new($false))
 
-              echo "deb [trusted=yes] http://${NEXUS_HOST}:8081/repository/syspulse/ ${APT_DIST} ${APT_COMPONENT}" > /etc/apt/sources.list.d/syspulse.list
-              apt-get update
-              apt-get install -y syspulse
-
-              echo "---- package info ----"
-              dpkg -s syspulse | grep -E "^(Package|Version|Architecture)"
-              echo "---- run app ----"
-              syspulse --version
-              syspulse
-            '
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          try {
+            docker run --rm -v "${workDir}:/work" -w /work `
+              -e "NEXUS_HOST=$($env:NEXUS_HOST)" `
+              -e "APT_DIST=$($env:APT_DIST)" `
+              -e "APT_COMPONENT=$($env:APT_COMPONENT)" `
+              ubuntu:22.04 bash /work/verify.sh
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item $scriptPath -ErrorAction SilentlyContinue
+          }
           Write-Host "Verification passed: syspulse installed from Nexus and runs correctly."
 
       # 5. Артефакты (для аудита)
